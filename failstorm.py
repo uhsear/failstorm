@@ -22,9 +22,11 @@ the old cause, become the majority, look like "more of the same" and be held.
     python failstorm.py --state s.json --failing now.txt --cause disk=no space
     python failstorm.py --state s.json --failing now.txt --apply
     python failstorm.py --state s.json --failing - --webhook URL --apply
+    FS_HOOK=URL python failstorm.py --state s.json --failing now.txt --webhook-env FS_HOOK --apply
 
 The failing file has one failure per line: NAME, or NAME, a tab and evidence
-text. A clean run writes the single line #ok. A file with neither is refused,
+text. A line whose first visible character is # is a comment. A clean run
+writes the single line #ok. A file with neither is refused,
 because a producer that crashed writes exactly that, and reading it as "all
 recovered" would send a false all-clear. --cause CAUSE=REGEX classifies the
 evidence text, first match wins. Nothing is sent or written without --apply.
@@ -34,7 +36,8 @@ its owner, and a run that holds or has nothing to say prints nothing.
 Exit codes: 0 the decision was made and carried out (or only shown), 2 a file
 could not be read or written, 3 the webhook did not take the notice and the
 state was not advanced, 4 the failing file held no failures and no #ok line,
-64 usage error, 70 an unexpected crash, which is never a finding.
+64 usage error or a malformed failing file (a repeated name, #ok beside
+failures, UTF-16 text), 70 an unexpected crash, which is never a finding.
 """
 
 from __future__ import print_function
@@ -53,6 +56,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.parse
@@ -60,8 +64,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Delivery is stdout (which cron mails) or an HTTP webhook. SMTP is not
-# offered: a mail server cannot be stubbed offline with the standard library
-# of every supported Python (smtpd was removed in 3.12).
+# offered: cron already mails stdout, and a second mail path would add a
+# credential to guard and one more way to send twice.
 
 STATE_VERSION = 1
 DEFAULT_STORM_MIN = 3
@@ -70,6 +74,8 @@ DEFAULT_REALERT_HOURS = 24.0
 DEFAULT_MAX_LIST = 25
 DEFAULT_TIMEOUT = 10.0
 EVIDENCE_WIDTH = 80
+MAX_NUMBER = 1e6          # largest --digest-hours, --realert-hours, --timeout
+YEAR_RANGE = (1900, 9000)  # times outside this overflow datetime arithmetic
 SUBJECT_TAG = "failstorm"
 
 REASON_TEXT = {
@@ -92,8 +98,8 @@ class DeliveryError(Exception):
 # ----------------------------------------------------------------- time
 
 def parse_time(text):
-    """An ISO 8601 time as an aware UTC datetime, or None when it is not one.
-    A time with no offset is read as UTC."""
+    """An ISO 8601 time as an aware UTC datetime, or None when it is not one
+    or lies outside YEAR_RANGE. A time with no offset is read as UTC."""
     if not isinstance(text, str):
         return None
     text = text.strip()
@@ -101,11 +107,14 @@ def parse_time(text):
         text = text[:-1] + "+00:00"
     try:
         value = datetime.datetime.fromisoformat(text)
-    except ValueError:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        value = value.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=datetime.timezone.utc)
-    return value.astimezone(datetime.timezone.utc)
+    if not YEAR_RANGE[0] <= value.year <= YEAR_RANGE[1]:
+        return None
+    return value
 
 
 def stamp(moment):
@@ -128,7 +137,7 @@ def parse_failures(text):
         line = line.rstrip("\r")
         if not line.strip():
             continue
-        if line.startswith("#"):
+        if line.lstrip().startswith("#"):
             saw_ok = saw_ok or line.strip().lower() == "#ok"
             continue
         name, _, evidence = line.partition("\t")
@@ -206,7 +215,9 @@ def check_state(raw):
             for k, v in seen.items()):
         raise ValueError("state field first_seen is not a map of strings")
     for key in ("incident_utc", "last_sent_utc"):
-        value = raw.get(key)
+        if key not in raw:
+            raise ValueError("state field %s is missing" % key)
+        value = raw[key]
         if value is not None and parse_time(value) is None:
             raise ValueError("state field %s is not a time" % key)
     return raw
@@ -339,8 +350,10 @@ def decide(state, failures, now, storm_min=DEFAULT_STORM_MIN,
     if cur == prior and not held_gone:
         if not cur:
             return Decision(False, "ok")
+        # A send time after now means the clock was set back: repeat at once
+        # instead of waiting for the clock to catch up.
         due = realert_hours > 0 and (
-            last_sent is None
+            last_sent is None or last_sent > now
             or now - last_sent >= datetime.timedelta(hours=realert_hours))
         if not due:
             return Decision(False, "unchanged")
@@ -418,6 +431,10 @@ def webhook_host(url):
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("--webhook must be an http or https URL")
+    if "@" in parts.netloc:
+        raise ValueError("--webhook cannot carry user:password@, because "
+                         "urllib does not turn it into basic auth. Put the "
+                         "secret in the path or the query instead.")
     try:
         port = parts.port
     except ValueError:
@@ -429,14 +446,33 @@ def webhook_host(url):
 
 def _finite(text):
     value = float(text)
-    if not math.isfinite(value) or value < 0:
-        raise argparse.ArgumentTypeError("%r is not a finite number of at "
-                                         "least 0" % text)
+    if not math.isfinite(value) or not 0 <= value <= MAX_NUMBER:
+        raise argparse.ArgumentTypeError("%r is not a number from 0 to %g"
+                                         % (text, MAX_NUMBER))
     return value
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse echoes the offending text of a refused flag on stderr, and
+    cron mails stderr. A mistyped --web or a bad --timeout would then mail
+    the webhook URL, which holds a secret. This parser names the flags and
+    never the values."""
+
+    def error(self, message):
+        head, _, rest = message.partition(": ")
+        if head == "unrecognized arguments":
+            flags = sorted(set(t.split("=", 1)[0] for t in rest.split()
+                               if t.startswith("-")))
+            detail = "unrecognized flags: %s" % (", ".join(flags) or "none")
+        else:
+            detail = "%s: the value is missing or refused" % head
+        self.print_usage(sys.stderr)
+        self.exit(2, "%s: error: %s (the text typed is not echoed, because "
+                  "it may hold a secret)\n" % (self.prog, detail))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="failstorm.py",
         description="Hold the mails about a failure storm, so the one that "
                     "matters is not lost.",
@@ -469,7 +505,12 @@ def _parse(argv):
                     help="names listed per section of a mail (default %d)"
                          % DEFAULT_MAX_LIST)
     ap.add_argument("--webhook", help="POST the notice as JSON to this http "
-                    "or https URL instead of printing it")
+                    "or https URL instead of printing it. The URL then shows "
+                    "in the process list: prefer --webhook-env.")
+    ap.add_argument("--webhook-env", dest="webhook_env", metavar="NAME",
+                    help="read the webhook URL from this environment "
+                         "variable, so a secret in it stays off the command "
+                         "line")
     ap.add_argument("--timeout", type=_finite, default=DEFAULT_TIMEOUT,
                     help="seconds to wait for the webhook (default %g)"
                          % DEFAULT_TIMEOUT)
@@ -499,6 +540,10 @@ def _read_failing(path):
     else:
         with open(path, "rb") as handle:
             raw = handle.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\0" in raw:
+        raise ValueError("the failing file looks like UTF-16 or binary data. "
+                         "Save it as UTF-8 (Windows PowerShell 5.1 '>' writes "
+                         "UTF-16).")
     return raw.decode("utf-8-sig", "replace")
 
 
@@ -533,19 +578,27 @@ def _run(argv):
     if not args.state or not args.failing:
         return _usage("--state and --failing are required. Use --self-test "
                       "to verify the tool without them.")
-    if args.storm_min < 0 or args.max_list < 1:
-        return _usage("--storm-min cannot be negative and --max-list must "
-                      "be at least 1.")
+    if args.storm_min < 0 or args.max_list < 1 or args.timeout <= 0:
+        return _usage("--storm-min cannot be negative, --max-list must be "
+                      "at least 1 and --timeout must be above 0.")
     now = datetime.datetime.now(datetime.timezone.utc)
     if args.now:
         now = parse_time(args.now)
         if now is None:
             return _usage("--now is not an ISO 8601 time.")
     host = None
+    webhook = args.webhook
+    if args.webhook_env:
+        if webhook:
+            return _usage("give --webhook or --webhook-env, not both.")
+        webhook = os.environ.get(args.webhook_env)
+        if not webhook:
+            return _usage("the environment variable %s is not set."
+                          % args.webhook_env)
     try:
         rules = parse_rules(args.cause)
-        if args.webhook:
-            host = webhook_host(args.webhook)
+        if webhook:
+            host = webhook_host(webhook)
     except ValueError as exc:
         return _usage(str(exc))
 
@@ -577,9 +630,9 @@ def _run(argv):
     if choice.send:
         notice = {"subject": choice.subject, "body": choice.body,
                   "reason": choice.reason, "open": len(failures)}
-        if args.webhook:
+        if webhook:
             try:
-                deliver_webhook(args.webhook, notice, args.timeout)
+                deliver_webhook(webhook, notice, args.timeout)
             except DeliveryError as exc:
                 print("error: %s. The state was not advanced, so the next "
                       "run sends again." % exc, file=sys.stderr)
@@ -747,6 +800,11 @@ def _self_test(tmp):
     check(parse_time("last tuesday") is None and parse_time(None) is None
           and parse_time("") is None, "text that is not a time is None")
     check(stamp(at(5)) == "2026-03-03T05:00:00Z", "stamp writes UTC with a Z")
+    for text in ("0001-01-01T00:00:00+05:00", "0001-01-01T00:00:00Z",
+                 "9999-12-31T23:59:59Z", "1800-01-01T00:00:00Z"):
+        check(parse_time(text) is None,
+              "the time %s is out of range and is not a time, where it "
+              "used to crash with OverflowError  <-- pinned defect" % text)
 
     # ---- the failing file
     got = parse_failures("a\tno space left\nb\n\n# a note\nc\t\r\n")
@@ -766,6 +824,11 @@ def _self_test(tmp):
            "evidence with no name is refused")
     raises(lambda: parse_failures("a\n#ok\n"),
            "#ok beside a failure is refused")
+    check(parse_failures("  #ok\n") == {} and parse_failures("\t#ok\n") == {},
+          "#ok after blanks is still an all clear, not a failure named "
+          "#ok  <-- pinned defect")
+    check(parse_failures("a\n   # note\n") == {"a": ""},
+          "a line whose first visible character is # is a comment")
 
     # ---- rules and causes
     rules = parse_rules(["disk=no space|i/o error", "auth=token"])
@@ -812,6 +875,19 @@ def _self_test(tmp):
     choice, _ = step(gap, fails(a="disk"), 1)
     check(choice.send and choice.reason == "realert",
           "a state with no send time repeats rather than stay silent")
+    choice, _ = step(state, fails(a="disk"), 24)
+    check(choice.send and choice.reason == "realert",
+          "the repeat is due at exactly --realert-hours")
+    choice, _ = step(state, fails(a="disk"), 23.99)
+    check(not choice.send and choice.reason == "unchanged",
+          "and not a minute before")
+    ahead = dict(state, last_sent_utc=stamp(at(9)))
+    choice, _ = step(ahead, fails(a="disk"), 1)
+    check(choice.send and choice.reason == "realert",
+          "a send time in the future (clock set back) repeats at once "
+          "instead of muting the tool  <-- pinned defect")
+    check(check_state(new_state()) == new_state(),
+          "a state with null incident and send times is well formed")
 
     three = fails(a="disk", b="disk", c="disk")
     choice, storm = step(fresh, three, 0)
@@ -891,10 +967,43 @@ def _self_test(tmp):
     check(not choice.send and choice.reason == "held",
           "a failure with no recognised cause waits, like more of the same")
     choice, _ = step(storm, unknown, 1, digest_hours=0)
-    check(choice.send, "--digest-hours 0 holds nothing")
+    check(choice.send and choice.reason == "changed",
+          "--digest-hours 0 holds nothing, and what it sends is a change, "
+          "not an empty digest  <-- pinned defect")
     choice, _ = step(storm, four, 1, storm_min=0)
     check(choice.send and "shared cause" not in choice.subject,
           "--storm-min 0 never starts an incident, so nothing is held")
+    choice, _ = step(storm, four, 0)
+    check(not choice.send and choice.reason == "held",
+          "a run at exactly the incident time still holds  <-- pinned "
+          "defect")
+
+    # ---- the layout of a mail
+    choice, _ = step(fresh, three, 0)
+    check("(0)" not in choice.body and "STILL OPEN" not in choice.body
+          and "RECOVERED" not in choice.body,
+          "a first mail has no empty section  <-- pinned defect")
+    check("wait for a digest at most every 6 hours" in choice.body,
+          "an incident mail tells the reader what is held")
+    choice, _ = step(fresh, three, 0, digest_hours=0)
+    check("wait for a digest" not in choice.body,
+          "with --digest-hours 0 the mail does not promise a digest  <-- "
+          "pinned defect")
+    choice, _ = step(fresh, fails(a="disk"), 0)
+    check("wait for a digest" not in choice.body,
+          "a single failure is no incident, so the mail does not promise a "
+          "digest  <-- pinned defect")
+    choice, _ = step(fresh, fails(a="disk", b="disk", c="auth"), 0)
+    check(choice.subject == "failstorm: 3 failing, shared cause: disk",
+          "the first incident mail names no new cause, whatever its mix  "
+          "<-- pinned defect")
+    ordered = dict(("n%02d" % i, ("disk", "")) for i in range(12))
+    choice, one = step(fresh, ordered, 0)
+    choice, _ = step(one, dict(ordered, z=("auth", "")), 1)
+    listed = choice.body.split("STILL OPEN (12):\n")[1].split("\nMore")[0]
+    check([line.split()[0] for line in listed.split("\n")]
+          == sorted(ordered), "STILL OPEN lists names in sorted order, not "
+          "hash order  <-- pinned defect")
 
     # ---- what always goes at once
     choice, rec = step(storm, fails(a="disk", b="disk"), 1)
@@ -1037,15 +1146,28 @@ def _self_test(tmp):
             ("an incident time that is a number", "last_sent_utc", 5)):
         raises(lambda k=key, v=value: check_state(dict(base_state, **{k: v})),
                "%s is refused" % label)
+    for key in ("incident_utc", "last_sent_utc"):
+        gapped = dict(new_state())
+        del gapped[key]
+        raises(lambda g=gapped: check_state(g),
+               "a state with no %s is refused, where it used to crash with "
+               "KeyError  <-- pinned defect" % key)
+    raises(lambda: check_state(dict(
+        base_state, incident_utc="0001-01-01T00:00:00+14:00")),
+        "an incident time that overflows is refused, where it used to "
+        "crash with OverflowError  <-- pinned defect")
     write("bom.json", b"\xef\xbb\xbf" + json.dumps(storm).encode("utf-8"))
     check(load_state(os.path.join(tmp, "bom.json"))[0] == storm,
           "a state saved with a byte order mark still loads")
     raises(lambda: save_state(os.path.join(tmp, "nodir", "s.json"), storm),
            "saving into a missing folder fails loudly", OSError)
-    raises(lambda: save_state(tmp, storm),
+    trap = os.path.join(tmp, "trap")
+    os.makedirs(os.path.join(trap, "s.json"))
+    raises(lambda: save_state(os.path.join(trap, "s.json"), storm),
            "saving over a folder fails loudly", OSError)
-    check(not [f for f in os.listdir(tmp) if f.startswith(".failstorm-")],
-          "and a failed save removes its temp file")
+    check(os.listdir(trap) == ["s.json"],
+          "and a failed save removes its temp file, which sits beside the "
+          "state path  <-- pinned defect")
     raises(lambda: load_state(tmp),
            "a state path that is a folder cannot be read", OSError)
 
@@ -1086,6 +1208,17 @@ def _self_test(tmp):
           "a held run prints nothing, so cron mails nothing, yet saves the "
           "hold  <-- pinned defect")
 
+    lone = write("lone.txt", "solo\tdisk error\n")
+    lone_state = os.path.join(tmp, "lone.json")
+    code, out, err = run(["--state", lone_state, "--failing", lone, "--apply"])
+    check(code == 0 and out.startswith("Subject: failstorm: 1 failing (solo)")
+          and "(0)" not in out, "a single failure through the command line "
+          "is mailed")
+    code, out, err = run(["--state", lone_state, "--failing", lone, "--apply"])
+    check(code == 0 and out == "" and err == "",
+          "and the next run prints nothing and no warning, so its state "
+          "with null times was read as good  <-- pinned defect")
+
     # ---- stdin, byte order marks, bad bytes
     code, out, _ = run(["--state", os.path.join(tmp, "x.json"),
                         "--failing", "-"],
@@ -1097,6 +1230,18 @@ def _self_test(tmp):
                         "--failing", "-"], stdin=b"caf\xe9\n")
     check(code == 0 and "caf" in out, "bytes that are not UTF-8 are replaced, "
           "not a crash")
+    u16 = os.path.join(tmp, "u16-state.json")
+    for label, blob in (("a UTF-16 file with a byte order mark",
+                         "#ok\n".encode("utf-16")),
+                        ("a UTF-16 file without one",
+                         "#ok\n".encode("utf-16-le")),
+                        ("a file with a NUL byte", b"a\x00b\n")):
+        code, out, err = run(["--state", u16, "--failing",
+                              write("u16.txt", blob), "--apply"])
+        check(code == 64 and "UTF-16" in err and out == ""
+              and not os.path.exists(u16),
+              "%s is refused with exit 64, not read as garbled names  <-- "
+              "pinned defect" % label)
 
     # ---- refusals and exit codes
     ok_file = write("ok.txt", "#ok\n")
@@ -1110,11 +1255,13 @@ def _self_test(tmp):
     check(code == 0 and "all clear" in out and
           json.loads(read(st))["signature"] == [],
           "#ok is a real all clear")
-    check(run(["--state", st, "--failing",
-               os.path.join(tmp, "missing.txt")])[0] == 2,
-          "a missing failing file exits 2")
-    check(run(["--state", tmp, "--failing", live])[0] == 2,
-          "a state path that cannot be read exits 2")
+    code, out, err = run(["--state", st, "--failing",
+                          os.path.join(tmp, "missing.txt")])
+    check(code == 2 and err.startswith("error: ") and "missing.txt" in err
+          and out == "", "a missing failing file exits 2 and says which")
+    code, out, err = run(["--state", tmp, "--failing", live])
+    check(code == 2 and err.startswith("error: ") and out == "",
+          "a state path that cannot be read exits 2 and says why")
     dup = write("dup.txt", "a\na\n")
     code, _, err = run(["--state", st, "--failing", dup])
     check(code == 64 and "line 2 repeats the name 'a'" in err,
@@ -1129,15 +1276,65 @@ def _self_test(tmp):
             code, _, err = run(["--state", st, "--failing", live, flag,
                                 value])
             check(code == 64, "%s %s exits 64" % (flag, value))
-    check(run(["--state", st, "--failing", live, "--now", "yesterday"])[0]
-          == 64, "an --now that is not a time exits 64")
+    for flag in ("--digest-hours", "--realert-hours", "--timeout"):
+        code, _, err = run(["--state", st, "--failing", live, flag, "1e300"])
+        check(code == 64, "%s 1e300 exits 64, where it used to overflow "
+              "datetime and exit 70  <-- pinned defect" % flag)
+    check(run(["--state", st, "--failing", live, "--timeout", "0"])[0] == 64,
+          "--timeout 0 exits 64, because it makes every delivery fail")
+    for value in ("0001-01-01T00:00:00+05:00", "yesterday"):
+        check(run(["--state", st, "--failing", live, "--now", value])[0]
+              == 64, "--now %s exits 64  <-- pinned defect" % value)
+    # Valid values reach decide() through the real command line.
+    code, out, err = run(["--state", st, "--failing", live,
+                          "--digest-hours", "0", "--realert-hours", "0",
+                          "--storm-min", "0", "--max-list", "1"])
+    check(code == 0 and "NEW (3):" in out and "... and 2 more" in out
+          and "wait for a digest" not in out and err == "",
+          "--digest-hours 0, --realert-hours 0, --storm-min 0 and "
+          "--max-list 1 are accepted and take effect")
+    code, out, err = run(["--state", st, "--failing", live,
+                          "--digest-hours", "0.5", "--realert-hours", "12",
+                          "--timeout", "3"])
+    check(code == 0 and "wait for a digest at most every 0.5 hours" in out
+          and err == "", "valid --digest-hours, --realert-hours and "
+          "--timeout values are accepted")
     check(run(["--state", st, "--failing", live, "--cause", "oops"])[0] == 64,
           "a bad --cause exits 64")
     for url in ("file:///etc/passwd", "ftp://host/x", "http://",
                 "http://host:port/x", "host/path"):
         check(run(["--state", st, "--failing", live, "--webhook", url])[0]
               == 64, "the webhook %s is refused" % url)
+    code, _, err = run(["--state", st, "--failing", live, "--webhook",
+                        "http://user:Hunter2@127.0.0.1:9/x", "--apply"])
+    check(code == 64 and "user:password@" in err and "Hunter2" not in err,
+          "a webhook with user:password@ is refused with exit 64, not "
+          "retried forever as exit 3, and the password is not echoed  <-- "
+          "pinned defect")
+    check(webhook_host("https://h:8443/x") == "h:8443"
+          and webhook_host("http://h/x") == "h",
+          "an https webhook URL is accepted and reduced to host:port")
     check(run(["-h"])[0] == 0, "-h exits 0")
+
+    # ---- a refused flag never echoes the text typed after it, because cron
+    # mails stderr and a webhook URL holds a secret
+    for kind, argv, named in (
+            ("a mistyped flag", ["--web", "http://127.0.0.1:9/T0K3N",
+                                 "--apply"], "--web"),
+            ("a mistyped flag joined with =", ["--webhook=http://x/T0K3N",
+                                               "--bogus=T0K3N"], "--bogus"),
+            ("a number that is not one", ["--timeout", "http://x/T0K3N"],
+             "--timeout"),
+            ("a value given to a switch", ["--apply=T0K3N"], "--apply"),
+            ("an integer that is not one", ["--storm-min", "T0K3N"],
+             "--storm-min"),
+            ("a flag with no value", ["--webhook"], "--webhook"),
+            ("a stray word", ["T0K3N"], "unrecognized flags: none")):
+        code, out, err = run(["--state", st, "--failing", live] + argv)
+        check(code == 64 and "T0K3N" not in err + out and named in err
+              and "usage:" in err,
+              "%s is refused with exit 64, names the flag and does not echo "
+              "the text  <-- pinned defect" % kind)
 
     # ---- abbreviations. Each case is a run that would succeed, or write, if
     # the prefix were accepted, so a refusal is not an unrelated usage error.
@@ -1214,11 +1411,28 @@ def _self_test(tmp):
               "control: the default opener does follow a redirect, as a GET "
               "with the body gone, which is why delivery refuses to")
         stub.status = "slow"
+        started = time.monotonic()
         code, out, err = run(["--state", wh_state, "--failing", ok_file,
                               "--webhook", stub.url(secret), "--apply",
                               "--timeout", "0.3"])
         check(code == 3 and "failed (" in err and read(wh_state) == saved,
               "a webhook that does not answer in time exits 3")
+        check(time.monotonic() - started < 2.0,
+              "and it gives up at --timeout (0.3 s) while the stub would "
+              "hold the call for 3 s")
+        stub.release.set()
+        # https: a stub with no certificate cannot finish a TLS handshake,
+        # so this shows the https path is taken and fails closed.
+        stub.status = 200
+        stub.seen[:] = []
+        code, out, err = run(["--state", wh_state, "--failing", ok_file,
+                              "--webhook", "https://127.0.0.1:%d%s"
+                              % (stub.port, secret), "--apply",
+                              "--timeout", "3"])
+        check(code == 3 and "webhook" in err and "T0K3N" not in err + out
+              and read(wh_state) == saved and not stub.seen,
+              "an https webhook is tried over TLS, fails closed with exit 3 "
+              "against a plain http stub, and the state is not advanced")
         stub.release.set()
         stub.status = 200
         stub.seen[:] = []
@@ -1227,6 +1441,25 @@ def _self_test(tmp):
         check(code == 0 and len(stub.seen) == 1
               and json.loads(read(wh_state))["signature"] == [],
               "after the stub recovers the same run delivers and advances")
+        # The URL from the environment, so the secret stays off argv.
+        os.environ["FS_TEST_HOOK"] = stub.url(secret)
+        stub.seen[:] = []
+        code, out, err = run(["--state", os.path.join(tmp, "wh-env.json"),
+                              "--failing", live, "--webhook-env",
+                              "FS_TEST_HOOK", "--apply"])
+        check(code == 0 and out == "" and err == "" and len(stub.seen) == 1
+              and stub.seen[0][:2] == ("POST", secret),
+              "--webhook-env delivers to the URL held in that environment "
+              "variable")
+        code, out, err = run(["--state", wh_state, "--failing", ok_file,
+                              "--webhook-env", "FS_TEST_HOOK_UNSET"])
+        check(code == 64 and "FS_TEST_HOOK_UNSET is not set" in err,
+              "--webhook-env with a variable that is not set exits 64")
+        code, out, err = run(["--state", wh_state, "--failing", ok_file,
+                              "--webhook-env", "FS_TEST_HOOK",
+                              "--webhook", stub.url(secret)])
+        check(code == 64 and "not both" in err and "T0K3N" not in err,
+              "--webhook and --webhook-env together exit 64")
         port = stub.port
     finally:
         stub.close()
@@ -1319,6 +1552,20 @@ def _self_test(tmp):
          empty_file], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     proc.communicate()
     check(proc.returncode == 4, "a real run on an empty file exits 4")
+    # A name that is not UTF-8 becomes U+FFFD, which a cp1252 pipe cannot
+    # write. Without the guard in main() the print raised and no state was
+    # saved.
+    latin = write("latin.txt", b"caf\xe9\nb\nc\n")
+    latin_state = os.path.join(tmp, "latin.json")
+    env = dict(os.environ, PYTHONIOENCODING="cp1252")
+    proc = subprocess.Popen(
+        [sys.executable, script, "--state", latin_state, "--failing", latin,
+         "--apply"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    out, err = proc.communicate()
+    check(proc.returncode == 0 and out.startswith(b"Subject: ")
+          and os.path.exists(latin_state),
+          "a name that the console cannot encode still prints the mail and "
+          "saves the state  <-- pinned defect")
 
     # ---- a crash is 70, never a finding
     real_decide = globals()["decide"]
@@ -1331,7 +1578,9 @@ def _self_test(tmp):
                               "--failing", live])
     finally:
         globals()["decide"] = real_decide
-    check(code == 70 and "fault in the tool" in err,
+    check(code == 70 and "fault in the tool" in err
+          and "Traceback (most recent call last)" in err
+          and "KeyError" in err,
           "an unexpected exception exits 70, not a code a wrapper reads as "
           "a finding  <-- pinned defect")
     real_self = globals()["self_test"]
