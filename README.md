@@ -54,10 +54,10 @@ PASS  an unexpected exception exits 70, not a code a wrapper reads as a finding 
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 ...
 --------------------------------------------------------------------
-166 assertions, 0 failed
+221 assertions, 0 failed
 ```
 
-The full run prints all 166 assertions. Each `...` line above is where this block is cut.
+The full run prints all 221 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -84,17 +84,17 @@ the previous notification listed.
 [Healthchecks](https://github.com/healthchecks/healthchecks) is described on GitHub as an
 open-source cron job and background task monitoring service. It was not tested for this report.
 
-A search of GitHub for the name `failstorm` found two unrelated repositories (a 2014 game project
-and a 2018 test bench), and searches for a state-file hold on cron failure mails found no other
+A search of GitHub for the name `failstorm` found two unrelated repositories (a 2014 project
+repository and a 2018 test bench), and searches for a state-file hold on cron failure mails found no other
 tool on the day it was run. That shows only that the search found nothing.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No third-party package, no database, no mail server.
 
-The self-test prints the same 166 assertions, line for line, on Windows (Python 3.13.2), on
-Python 3.9.25 and on Ubuntu (Python 3.12.3). `coverage run --branch failstorm.py --self-test`
-reports 100 percent of lines and branches (785 statements, 154 branches).
+The self-test prints the same 221 assertions, line for line, on Windows (Python 3.13.2 and
+3.9.25) and on Ubuntu (Python 3.12.3 and 3.9). `coverage run --branch failstorm.py --self-test`
+reports 100 percent of lines and branches (914 statements, 184 branches). No line is excluded.
 
 ```
 git clone https://github.com/uhsear/failstorm.git
@@ -111,11 +111,13 @@ python failstorm.py --state fs.json --failing now.txt
 python failstorm.py --state fs.json --failing now.txt --cause "storage=no space|read-only"
 python failstorm.py --state fs.json --failing now.txt --apply
 python failstorm.py --state fs.json --failing - --webhook http://host:8080/hook --apply
+FS_HOOK=http://host:8080/hook python failstorm.py --state fs.json --failing now.txt --webhook-env FS_HOOK --apply
 ```
 
 A crontab line, run every hour. It assumes `check_jobs.sh` prints the failing file to stdout.
 The `;` is deliberate: the check may exit non-zero when jobs fail, and the tool must still run.
-A check that crashes leaves an empty file, which the tool refuses with exit 4.
+A check that crashes before it writes anything leaves an empty file, which the tool refuses with
+exit 4. A check that dies halfway is not caught, see Limits.
 
 ```
 0 * * * * /path/to/check_jobs.sh > /var/tmp/now.txt; python3 /path/to/failstorm.py --state /var/tmp/fs.json --failing /var/tmp/now.txt --cause "storage=no space" --apply
@@ -130,8 +132,9 @@ A check that crashes leaves an empty file, which the tool refuses with exit 4.
 | `--digest-hours` | `6` | Hours a held failure waits after the incident mail. `0` holds nothing. |
 | `--realert-hours` | `24` | Hours after which an unchanged set is mailed again. `0` never repeats. |
 | `--max-list` | `25` | Names listed per section of a mail. The rest become "and N more". |
-| `--webhook` | off | POST the notice as JSON to this http or https URL instead of printing it. |
-| `--timeout` | `10` | Seconds to wait for the webhook. |
+| `--webhook` | off | POST the notice as JSON to this http or https URL instead of printing it. A URL given here shows in the process list, and Debian cron writes each command line to syslog. Prefer `--webhook-env`. |
+| `--webhook-env` | off | The name of an environment variable that holds the webhook URL. Keeps the URL off the command line. Not allowed with `--webhook`. |
+| `--timeout` | `10` | Seconds to wait for the webhook, for each socket operation. |
 | `--now` | the clock | The time of this run as ISO 8601. For a replay. |
 | `--apply` | off | Send the notice and write the state. Without it nothing is sent or written. |
 | `--self-test` | off | Run the assertions and exit. Other flags are ignored. |
@@ -150,6 +153,17 @@ of the job's log. A line that starts with `#` is a comment. A clean run writes t
 A file with no failures and no `#ok` line is refused with exit 4. A check script that crashed
 before it wrote anything leaves exactly that file. If the file were read as "nothing is failing",
 the tool would send a false all clear and close the incident.
+
+The producer must write a tab between the name and the evidence. A name written with spaces
+instead keeps the evidence inside the name, so no `--cause` rule matches it and the failure is
+held as unclassified. A name that starts with `#` reads as a comment and is dropped, so name jobs
+without a leading `#`. A name with a control character, such as a lone carriage return, is refused
+with exit 64, because it would reach the Subject line of the mail. A file that is UTF-16 or holds a
+NUL byte is refused with exit 64.
+
+The evidence text is printed as given, up to 80 characters per failure, to stdout and into the
+webhook body. The state file keeps only the names. A secret in a job's error line, such as an API
+key in a request URL, is mailed unchanged, so the producer script must scrub it.
 
 A name that appears twice is refused. The tool does not merge two lines about one job, because the
 second line would hide the first.
@@ -184,7 +198,7 @@ A subject line also names a cause that is new since the last incident mail, as i
 
 Six files, six cron ticks, and the real output. The `--now` flag stands in for the clock.
 `t1.txt` has three storage failures. `t2.txt` adds `export-d`. `t3.txt` adds a login failure
-`report-a`. `t4.txt` adds `export-e`. `t5.txt` is the same set as `t4.txt`, ten hours after the
+`report-a`. `t4.txt` adds `export-e`. `t5.txt` is the same set as `t4.txt`, eight hours after the
 first mail. `t6.txt` is `#ok`.
 
 ```
@@ -296,7 +310,8 @@ on success. The self-test exercises the webhook against a stub HTTP server on `1
   control request, then shows the tool does not do it. The Python
   [urllib.request](https://docs.python.org/3/library/urllib.request.html) docs describe
   `redirect_request` as the hook that decides whether a redirect happens.
-- No message names the URL. A webhook URL often carries its secret in the path. The self-test
+- No message names the path or query of the URL, and the name typed after `--webhook-env` is never
+  echoed. A webhook URL often carries its secret in the path. The self-test
   runs with a marker in the path and searches stdout, stderr and the state file for it.
 - If the notice was delivered and the state then cannot be written, the tool exits 2 and says the
   notice went out, because the next run will send it again.
@@ -313,7 +328,8 @@ stubbed offline with the standard library on every supported version. Cron's own
 | 2 | A file could not be read or written. |
 | 3 | The webhook did not take the notice. The state was not advanced. |
 | 4 | The failing file had no failures and no `#ok` line. Nothing was changed. |
-| 64 | Usage error, including a refused abbreviation. |
+| 1 | Only `--self-test` returns it, when an assertion fails. |
+| 64 | Usage error, including a refused abbreviation. Also a webhook URL with `user:password@`, a failing file that repeats a name, is UTF-16 or holds a NUL byte, or has `#ok` beside failures. |
 | 70 | An unexpected crash. This is a fault in the tool, not a finding. |
 
 ## Limits
@@ -321,8 +337,56 @@ stubbed offline with the standard library on every supported version. Cron's own
 - The state file has one writer. There is no lock. Two overlapping runs can both read the old
   state and both send. Keep the interval longer than the run, or wrap the call in `flock`.
 - A new failure with no recognised cause is held, like more of the same, up to `--digest-hours`.
-  If your `--cause` rules are thin, most failures will be unclassified and held. Write rules for
-  the causes you care about, and keep `--digest-hours` short enough to live with.
+  The `--cause` rules decide what is sent at once. If your rules are thin, most failures will be
+  unclassified and held. Write rules for the causes you care about, and keep `--digest-hours`
+  short enough to live with.
+- With no `--cause` rule at all, every failure is unclassified, so every new failure during an
+  incident waits for the digest, up to 6 hours by default. The quick-start lines show that form,
+  and the login-failure story needs `--cause` rules.
+- If `--digest-hours` is larger than `--realert-hours`, a storm that keeps changing is held for
+  the whole digest wait and the repeat never fires: with `--digest-hours 48 --realert-hours 24`, a
+  failure held at hour 1 still prints nothing at hour 30.
+- A job that stays in the failing file but changes cause, for example from disk full to an expired
+  token, is judged to be the same set and stays silent until `--realert-hours`. The tool compares
+  names, not causes.
+- A job that keeps flapping between failing and recovered is mailed on every recovery, because a
+  recovery is always sent at once.
+- A check script that dies after it wrote part of the list, with no `#ok` line, reads as a smaller
+  failing set, and the missing jobs are mailed as recovered. Only a completely empty file is
+  refused (exit 4).
+- The elapsed-time checks compare to the second, so a cron interval equal to `--realert-hours` or
+  `--digest-hours` can skip one run: a mail sent at 02:00:03 and a next daily run at 02:00:01 is
+  "unchanged", and the reminder comes 48 hours later. Set the hours slightly below the cron
+  interval.
+- A `--cause` regular expression runs over the whole evidence line with no length or time limit,
+  so a pattern prone to catastrophic backtracking can stall a run.
+- With `--apply`, a `--state` path that names an existing file which is not a failstorm state is
+  overwritten after a warning on stderr. If you swap `--state` and `--failing`, the producer's file
+  is replaced by the state JSON. Check the `--state` path before you add `--apply`.
+- A `--state` path that is a symlink is replaced by a regular file, and the link target is left
+  unchanged (checked on Linux).
+- An unreadable state file on a run with nothing to send, such as a clean `#ok` run, is never
+  rewritten, so the warning on stderr repeats on every run, and cron mails it, until a failure
+  appears.
+- If stdout is closed or full (`>&-` gives exit 0, `/dev/full` gives exit 120), the mail is lost
+  and the state is still saved, so the next run does not resend. Cron always supplies a pipe, so
+  normal use does not see this.
+- The error text for a malformed webhook URL can repeat part of its host: a fullwidth character in
+  the host gives a message that quotes the host, and `http://[S3CR3T]/x` echoes the bracketed text
+  (exit 64). The path and query are never echoed, so a secret in the path stays hidden. Keep the
+  secret in the path, not in the host.
+- Two failing-file names that differ only by non-UTF-8 bytes both decode to U+FFFD and are refused
+  as a repeated name (exit 64). A file with bare CR line endings is read as one job whose name
+  holds the CRs, and is refused for that.
+- `--now` uses `datetime.fromisoformat`, which accepts more forms on Python 3.11 and later than on
+  3.9 and 3.10. On 3.9 a fractional second that is not 3 or 6 digits, and the basic form
+  `20260303T020000Z`, exit 64, and a state time like `02:00:00.5Z` is refused. Write `--now` as
+  `YYYY-MM-DDTHH:MM:SSZ` so a replay is the same on every host.
+- `--timeout` applies to each blocking socket operation, not to the whole call and not to the DNS
+  lookup. A server that sends one byte at a time can hold a run longer than `--timeout`.
+- Mutants that only change a boundary or a cosmetic detail survive: the year range ends (1900 and
+  9000), `--digest-hours`, `--realert-hours` or `--timeout` equal to 1e6, and the indent and key
+  order of the state file. None changes a verdict.
 - Causes are regular expressions over the evidence text. A wrong rule gives a wrong hold.
 - A cron daemon that is not running, or a check script that never runs, produces silence. This
   tool cannot see that. Pair it with a separate monitor that expects a regular check-in, such as Healthchecks (not
@@ -330,12 +394,14 @@ stubbed offline with the standard library on every supported version. Cron's own
 - The tool was never run under a real cron daemon in this test. The cron behaviour (any output is
   mailed) is cited from its man page. What was tested is that a real process prints nothing when
   it holds.
-- An unreadable state file is treated as empty, with a warning on stderr. The next run may
-  announce open failures again. An extra mail is a better failure than a silent one.
+- A state file whose content is not a failstorm state is treated as empty, with a warning on
+  stderr. The next run may announce open failures again. An extra mail is a better failure than a
+  silent one. A state path that cannot be opened at all (a folder, or permission denied) exits 2
+  with no warning.
 - All times are UTC. A recorded incident time in the future never holds, so a clock set back
   cannot mute the tool.
-- Coverage was measured on Windows only. The Linux and Python 3.9 runs ran the same self-test and
-  printed the same 166 assertions.
+- Coverage was measured on Windows only. The Linux 3.12 and 3.9 and the Windows 3.9 runs ran the
+  same self-test and printed the same 221 assertions.
 
 ## Related
 

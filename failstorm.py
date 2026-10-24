@@ -128,9 +128,10 @@ def parse_failures(text):
     """{name: evidence} from the failing file's text.
 
     Raises EmptyInput for a file with no failure and no #ok line, and
-    ValueError for a duplicated name, a line with no name, or #ok beside
-    failures. A name repeated is refused, not merged, because the second
-    line's evidence would silently replace or lose the first's."""
+    ValueError for a duplicated name, a line with no name, a control
+    character in a name, or #ok beside failures. A name repeated is refused,
+    not merged, because the second line's evidence would silently replace or
+    lose the first's."""
     failures = {}
     saw_ok = False
     for number, line in enumerate(text.split("\n"), 1):
@@ -144,6 +145,11 @@ def parse_failures(text):
         name = name.strip()
         if not name:
             raise ValueError("line %d has evidence but no name" % number)
+        # A lone CR or other control character in a name would reach the
+        # Subject line of the mail, where it can start a new header.
+        if any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ValueError("line %d has a control character in the name"
+                             % number)
         if name in failures:
             raise ValueError("line %d repeats the name %r" % (number, name))
         failures[name] = evidence.strip()
@@ -593,8 +599,10 @@ def _run(argv):
             return _usage("give --webhook or --webhook-env, not both.")
         webhook = os.environ.get(args.webhook_env)
         if not webhook:
-            return _usage("the environment variable %s is not set."
-                          % args.webhook_env)
+            # The name is not echoed: a URL typed here by mistake may hold
+            # the secret, and cron mails stderr.
+            return _usage("the environment variable named by --webhook-env "
+                          "is not set.")
     try:
         rules = parse_rules(args.cause)
         if webhook:
@@ -822,6 +830,9 @@ def _self_test(tmp):
            "a repeated name is refused, not merged")
     raises(lambda: parse_failures("\tevidence\n"),
            "evidence with no name is refused")
+    raises(lambda: parse_failures("a\rBcc: x\tboom\n"),
+           "a name with a lone carriage return is refused, so it cannot "
+           "start a mail header  <-- pinned defect")
     raises(lambda: parse_failures("a\n#ok\n"),
            "#ok beside a failure is refused")
     check(parse_failures("  #ok\n") == {} and parse_failures("\t#ok\n") == {},
@@ -881,6 +892,14 @@ def _self_test(tmp):
     choice, _ = step(state, fails(a="disk"), 23.99)
     check(not choice.send and choice.reason == "unchanged",
           "and not a minute before")
+    choice, _ = step(state, fails(a="disk"), 0)
+    check(not choice.send and choice.reason == "unchanged",
+          "a rerun in the very second of the last send is quiet  <-- "
+          "pinned defect")
+    choice, _ = step(state, fails(a="disk"), 1, realert_hours=0.5)
+    check(choice.send and choice.reason == "realert",
+          "a --realert-hours below one hour still repeats  <-- pinned "
+          "defect")
     ahead = dict(state, last_sent_utc=stamp(at(9)))
     choice, _ = step(ahead, fails(a="disk"), 1)
     check(choice.send and choice.reason == "realert",
@@ -977,6 +996,19 @@ def _self_test(tmp):
     check(not choice.send and choice.reason == "held",
           "a run at exactly the incident time still holds  <-- pinned "
           "defect")
+    choice, _ = step(storm, four, 1 / 6.0, digest_hours=0.5)
+    check(not choice.send and choice.reason == "held",
+          "a --digest-hours below one hour still holds  <-- pinned defect")
+    choice, _ = step(storm, four, 0.5, digest_hours=0.5)
+    check(choice.send and choice.reason == "digest",
+          "and the digest is due at that shorter wait")
+    choice, one = step(fresh, fails(a="disk"), 0, storm_min=1)
+    check(one["incident_utc"] == stamp(at(0)),
+          "--storm-min 1 makes a single failure an incident  <-- pinned "
+          "defect")
+    choice, _ = step(one, fails(a="disk", b="disk"), 1, storm_min=1)
+    check(not choice.send and choice.reason == "held",
+          "so a second failure of the same cause is held")
 
     # ---- the layout of a mail
     choice, _ = step(fresh, three, 0)
@@ -1002,7 +1034,7 @@ def _self_test(tmp):
     choice, _ = step(one, dict(ordered, z=("auth", "")), 1)
     listed = choice.body.split("STILL OPEN (12):\n")[1].split("\nMore")[0]
     check([line.split()[0] for line in listed.split("\n")]
-          == sorted(ordered), "STILL OPEN lists names in sorted order, not "
+          == sorted(ordered), "still open lists names in sorted order, not "
           "hash order  <-- pinned defect")
 
     # ---- what always goes at once
@@ -1126,7 +1158,7 @@ def _self_test(tmp):
     check(not [f for f in os.listdir(tmp) if f.startswith(".failstorm-")],
           "saving leaves no temp file behind")
     for label, text in (("a state of text that is not JSON", "{not json"),
-                        ("JSON of the wrong shape", "[1, 2]"),
+                        ("json of the wrong shape", "[1, 2]"),
                         ("a deeply nested array", "[" * 100000),
                         ("a state of another version",
                          '{"version": 9}')):
@@ -1453,8 +1485,14 @@ def _self_test(tmp):
               "variable")
         code, out, err = run(["--state", wh_state, "--failing", ok_file,
                               "--webhook-env", "FS_TEST_HOOK_UNSET"])
-        check(code == 64 and "FS_TEST_HOOK_UNSET is not set" in err,
+        check(code == 64 and "named by --webhook-env is not set" in err,
               "--webhook-env with a variable that is not set exits 64")
+        code, out, err = run(["--state", wh_state, "--failing", ok_file,
+                              "--webhook-env", stub.url(secret)])
+        check(code == 64 and "is not set" in err
+              and "T0K3N" not in out + err,
+              "a URL typed after --webhook-env is not echoed  <-- pinned "
+              "defect")
         code, out, err = run(["--state", wh_state, "--failing", ok_file,
                               "--webhook-env", "FS_TEST_HOOK",
                               "--webhook", stub.url(secret)])
